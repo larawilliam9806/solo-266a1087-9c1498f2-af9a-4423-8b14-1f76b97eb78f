@@ -4,8 +4,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 from .db import connect, init_db
-from .models import RegisterRequest
-from .registry import ConflictError, register_documents
+from .models import InspectionRequest, RegisterRequest
+from .quality import (BatchNotFoundError, NotInspectableError,
+                      VersionConflictError, record_inspection)
+from .registry import ConflictError, QualityBlockError, register_documents
 from .state import load_state
 from .trace import build_trace
 
@@ -19,7 +21,8 @@ async def lifespan(_app):
 app = FastAPI(
     title="再生塑料发货追溯 API",
     version="1.0.0",
-    description="登记进料批、工序投入产出批与整批发货；按不合格进料批追溯各已发批的可能含量。",
+    description="登记进料批、工序投入产出批与整批发货；按不合格进料批追溯各已发批的可能含量；"
+                "发货前核对本批及全部上游批次的质检结论。",
     lifespan=lifespan,
 )
 
@@ -32,9 +35,15 @@ def health():
 @app.post("/api/documents", status_code=201)
 def post_documents(req: RegisterRequest):
     """登记单据（进料/工序/发货）。同一请求内多张单据原子生效：
-    批号或重量冲突、形成循环、保存失败时整次不生效。"""
+    批号或重量冲突、形成循环、发货全链未全部合格、保存失败时整次不生效。"""
     try:
         return register_documents(req.documents)
+    except QualityBlockError as exc:
+        raise HTTPException(status_code=409, detail={
+            "message": str(exc),
+            "blocking_batches": exc.blocking_batches,
+            "shipments": exc.blocking,
+        })
     except ConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -73,6 +82,8 @@ def list_batches():
 
 @app.get("/api/batches/{batch_no}")
 def get_batch(batch_no: str):
+    """批次详情：重量、来源、去向、本批质检结论与版号，
+    以及本批和上游未合格（待检/不合格）的批号列表。"""
     conn = connect()
     try:
         state = load_state(conn)
@@ -94,12 +105,41 @@ def get_batch(batch_no: str):
         destination = {"type": "shipment", "shipment_id": state.shipments[batch_no]}
     else:
         destination = {"type": "none"}
+    rec = state.inspections.get(batch_no)
     return {
         "batch_no": batch_no,
         "weight": state.weights[batch_no],
         "source": source,
         "destination": destination,
+        "inspection": {
+            "inspection_no": rec["inspection_no"] if rec else None,
+            "conclusion": state.conclusion_of(batch_no),
+            "version": state.version_of(batch_no),
+        },
+        "unqualified_batches": state.unqualified_in_chain(batch_no),
     }
+
+
+@app.put("/api/batches/{batch_no}/inspection")
+def put_inspection(batch_no: str, req: InspectionRequest):
+    """录入或改判某批的质检结论（检验号 + pending/pass/fail）。
+
+    仅已登记的进料批或工序产出批可录入。请求须带所见版号
+    （expected_version，未录入的批为 0），版号已变即拒绝（409），
+    写入失败时保留原账。
+    """
+    try:
+        return record_inspection(batch_no, req.inspection_no,
+                                 req.conclusion, req.expected_version)
+    except BatchNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except NotInspectableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except VersionConflictError as exc:
+        raise HTTPException(status_code=409, detail={
+            "message": str(exc),
+            "current_version": exc.current,
+        })
 
 
 @app.get("/api/processes/{process_id}")

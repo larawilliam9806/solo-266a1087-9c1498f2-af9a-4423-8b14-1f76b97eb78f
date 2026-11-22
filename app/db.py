@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS shipments (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_no TEXT NOT NULL UNIQUE REFERENCES batches(batch_no)
 );
+-- 质检结论：每批至多一条；version 从 1 起，每次改判 +1（未录入的批视为待检、版号 0）
+CREATE TABLE IF NOT EXISTS inspections (
+    batch_no      TEXT PRIMARY KEY REFERENCES batches(batch_no),
+    inspection_no TEXT NOT NULL,
+    conclusion    TEXT NOT NULL CHECK (conclusion IN ('pending', 'pass', 'fail')),
+    version       INTEGER NOT NULL CHECK (version >= 1)
+);
 """
 
 

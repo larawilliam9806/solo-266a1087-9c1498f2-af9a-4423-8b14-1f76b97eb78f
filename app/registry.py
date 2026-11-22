@@ -1,15 +1,26 @@
-"""登记：校验（重量一致、来源/去向唯一、无循环）并在单个事务内落库。
+"""登记：校验（重量一致、来源/去向唯一、无循环、发货全链合格）并在单个事务内落库。
 
-任何冲突、循环或保存失败都会回滚，整次登记不生效。
+任何冲突、循环、质检阻断或保存失败都会回滚，整次登记不生效。
 """
 from collections import deque
 
 from .db import connect
-from .state import load_state
+from .state import State, load_state
 
 
 class ConflictError(Exception):
     """登记与已有账簿冲突（批号、重量、来源/去向唯一性、循环）。"""
+
+
+class QualityBlockError(ConflictError):
+    """发货被阻断：本批或上游存在未合格（待检/不合格）批次，整次登记不生效。"""
+
+    def __init__(self, blocking):
+        # blocking: {发货批号: [阻断发货的批号, ...]}
+        self.blocking = {b: list(bs) for b, bs in blocking.items()}
+        self.blocking_batches = sorted({x for bs in blocking.values() for x in bs})
+        super().__init__("发货被阻断，本批或上游存在未合格批次："
+                         + "、".join(self.blocking_batches))
 
 
 def _ensure_acyclic(processes: dict) -> None:
@@ -123,6 +134,28 @@ def register_documents(documents) -> dict:
                 "outputs": [b for b, _ in np["outputs"]],
             }
         _ensure_acyclic(all_processes)
+
+        # 发货质检闸：本批和全部上游批次均合格（pass）才可入账。
+        # 在本事务（BEGIN IMMEDIATE）内读取已入账的质检结论——并发的改判
+        # 若先提交，必然参与这里的校验；后提交的改判只能等本次登记落账。
+        if new_shipments:
+            merged = State(
+                weights=weights,
+                incoming=state.incoming | set(new_incoming),
+                processes={**state.processes,
+                           **{np["temp"]: {"inputs": [b for b, _ in np["inputs"]],
+                                           "outputs": [b for b, _ in np["outputs"]]}
+                              for np in new_processes}},
+                shipments=state.shipments,
+                inspections=state.inspections,
+            )
+            blocking = {}
+            for b in new_shipments:
+                unqualified = merged.unqualified_in_chain(b)
+                if unqualified:
+                    blocking[b] = unqualified
+            if blocking:
+                raise QualityBlockError(blocking)
 
         for b, w in new_batches.items():
             conn.execute("INSERT INTO batches(batch_no, weight) VALUES (?, ?)", (b, w))

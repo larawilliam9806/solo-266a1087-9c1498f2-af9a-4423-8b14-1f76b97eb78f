@@ -56,3 +56,12 @@ Document = Annotated[Union[IncomingDoc, ProcessDoc, ShipmentDoc],
 class RegisterRequest(BaseModel):
     """一次登记：可含多张单据，全部校验通过才落库，否则整次不生效。"""
     documents: List[Document] = Field(min_length=1)
+
+
+class InspectionRequest(BaseModel):
+    """录入/改判某批的质检结论。expected_version 为所见版号（未录入的批为 0），
+    与当前版号不一致时拒绝（409）。"""
+    inspection_no: Annotated[str, StringConstraints(strip_whitespace=True,
+                                                    min_length=1, max_length=128)]
+    conclusion: Literal["pending", "pass", "fail"]
+    expected_version: int = Field(ge=0)
